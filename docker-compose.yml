@@ -1,0 +1,12 @@
+services:
+  plannerbot:
+    build: .
+    container_name: plannerbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - plannerbot_db:/app/data
+
+volumes:
+  plannerbot_db:

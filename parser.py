@@ -4,12 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List
 
 import pytz
-
-# openai — опциональная зависимость: локальные правила работают и без неё.
-try:
-    from openai import OpenAI  # type: ignore
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+from openai import OpenAI
 
 from config import OPENAI_API_KEY
 
@@ -69,12 +64,15 @@ def _get_times(user_times: Optional[Dict[str, Any]]) -> Dict[str, str]:
     """
     Достаёт пользовательские времена (с дефолтами).
     user_times приходит из utils.get_user_settings(user_id)
+    Поддерживаем оба формата ключей:
+      - morning/day/evening/default
+      - morning_time/day_time/evening_time/default_time
     """
     user_times = user_times or {}
-    morning = _normalize_hhmm(str(user_times.get("morning_time", "")), "09:00")
-    day = _normalize_hhmm(str(user_times.get("day_time", "")), "14:00")
-    evening = _normalize_hhmm(str(user_times.get("evening_time", "")), "20:00")
-    default = _normalize_hhmm(str(user_times.get("default_time", "")), "20:00")
+    morning = _normalize_hhmm(str(user_times.get("morning", user_times.get("morning_time", ""))), "09:00")
+    day = _normalize_hhmm(str(user_times.get("day", user_times.get("day_time", ""))), "14:00")
+    evening = _normalize_hhmm(str(user_times.get("evening", user_times.get("evening_time", ""))), "20:00")
+    default = _normalize_hhmm(str(user_times.get("default", user_times.get("default_time", ""))), "20:00")
     return {"morning": morning, "day": day, "evening": evening, "default": default}
 
 
@@ -163,15 +161,105 @@ def _looks_like_datetime_text(user_text: str) -> bool:
     return any(k in t for k in keywords)
 
 
+# ---------------------------
+# EXPLICIT DATE+TIME (local)
+# ---------------------------
+
+_EXPLICIT_DT_RE = re.compile(
+    r"""(?ix)
+    \b
+    (?P<day>\d{1,2})[./-](?P<month>\d{1,2})
+    (?:[./-](?P<year>\d{2,4}))?
+    (?:\s*(?:года?|г\.)\s*)?
+    [\s,]+
+    (?:в|во)?\s*
+    (?P<hour>\d{1,2})[:.](?P<minute>\d{2})
+    \b
+    """,
+)
+
+
+_DATE_TOKEN_RE = re.compile(
+    r"""(?x)
+    \b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b
+    """
+)
+
+
+def _normalize_year_2or4(y: Optional[str]) -> int:
+    """
+    Нормализация двухзначного года: 00-69 -> 2000-2069, 70-99 -> 1970-1999.
+    Если год не указан — используем текущий.
+    """
+    now_year = _now_moscow().year
+    if not y:
+        return now_year
+    yy = int(y)
+    if yy < 100:
+        return 2000 + yy if yy <= 69 else 1900 + yy
+    return yy
+
+
+def _try_parse_explicit_datetime(user_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Локально ловим явную дату+время (например: 21.12.25 14:48, 01-01-2026 00:15).
+    ВАЖНО: текст задачи НЕ обрезаем — вырезаем только сам фрагмент даты/времени.
+    """
+    t = (user_text or "").strip()
+    m = _EXPLICIT_DT_RE.search(t)
+    if not m:
+        return None
+
+    day = int(m.group("day"))
+    month = int(m.group("month"))
+    year = _normalize_year_2or4(m.group("year"))
+    hh = int(m.group("hour"))
+    mm = int(m.group("minute"))
+
+    if not (1 <= day <= 31 and 1 <= month <= 12 and 0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+
+    try:
+        dt = MOSCOW_TZ.localize(datetime(year, month, day, hh, mm, 0))
+    except Exception:
+        return None
+
+    # сохраняем текст ДО и ПОСЛЕ даты
+    before = t[:m.start()].strip()
+    after = t[m.end():].strip()
+
+    combined = f"{before} {after}".strip()
+    combined = re.sub(r"\s+", " ", combined)
+    combined = re.sub(r"\s+,", ",", combined)
+    combined = re.sub(r",\s+", ", ", combined)
+    combined = combined.strip(" ,")
+
+    task_text = _clean_task(combined) if combined else _clean_task(t)
+
+    return {
+        "task": task_text,
+        "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "original": user_text,
+        "error": None,
+    }
+
+
 def _try_parse_explicit_time(user_text: str, default_time_hhmm: str) -> Optional[Dict[str, Any]]:
     """
     Локально ловим явное время вида 11:45 или 11.45.
-    Ставим сегодня это время, а если уже прошло — завтра.
+    ✅ Учитываем слова "сегодня/завтра/послезавтра".
     """
     t = user_text.strip()
     m = re.search(r"\b(\d{1,2})[:.](\d{2})\b", t)
     if not m:
         return None
+
+    # Защита: не путать дату вида 01.01.26 с временем 01:01
+    for dm in _DATE_TOKEN_RE.finditer(t):
+        ds, de = dm.span()
+        ms, me = m.span()
+        if not (me <= ds or ms >= de):
+            return None
 
     hh = int(m.group(1))
     mm = int(m.group(2))
@@ -179,7 +267,18 @@ def _try_parse_explicit_time(user_text: str, default_time_hhmm: str) -> Optional
         return None
 
     now = _now_moscow()
-    dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    tl = t.lower()
+
+    base = now
+    if "послезавтра" in tl:
+        base = now + timedelta(days=2)
+    elif "завтра" in tl:
+        base = now + timedelta(days=1)
+    # "сегодня" -> base = now
+
+    dt = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    # если всё равно получилось в прошлом (например "сегодня в 10", а уже 12) — переносим на завтра
     if dt <= now:
         dt = dt + timedelta(days=1)
 
@@ -243,6 +342,50 @@ def _try_parse_simple_dayparts(user_text: str, times: Dict[str, str]) -> Optiona
         "error": None,
     }
 
+def _try_parse_relative_day_only(user_text: str, default_time_hhmm: str) -> Optional[Dict[str, Any]]:
+    """
+    Локально обрабатываем "сегодня/завтра/послезавтра" без явного времени и без "утром/днем/вечером".
+    Ставим default_time.
+    """
+    t = (user_text or "").strip()
+    tl = t.lower()
+
+    if "послезавтра" not in tl and "завтра" not in tl and "сегодня" not in tl:
+        return None
+
+    # если в тексте есть явное время или цифры/дата — пусть это решают другие правила
+    if re.search(r"\b\d{1,2}[:.]\d{2}\b", tl):
+        return None
+    if re.search(r"\b\d{1,2}[./-]\d{1,2}\b", tl):
+        return None
+    if re.search(r"\b(утром|утра|дн[её]м|днем|вечером|вечера)\b", tl):
+        return None
+
+    now = _now_moscow()
+    base = now
+    if "послезавтра" in tl:
+        base = now + timedelta(days=2)
+    elif "завтра" in tl:
+        base = now + timedelta(days=1)
+    # "сегодня" -> base = now
+
+    hh, mm = int(default_time_hhmm[:2]), int(default_time_hhmm[3:])
+    dt = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    # если вдруг "сегодня", а default уже прошел — переносим на завтра
+    if dt <= now:
+        dt = dt + timedelta(days=1)
+
+    task_text = re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", t, flags=re.IGNORECASE)
+    task_text = _clean_task(task_text)
+
+    return {
+        "task": task_text if task_text else _clean_task(t),
+        "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "original": user_text,
+        "error": None,
+    }
+
 
 def _build_prompt(user_text: str, times: Dict[str, str]) -> str:
     """
@@ -294,8 +437,6 @@ def _build_prompt(user_text: str, times: Dict[str, str]) -> str:
 
 
 def _parse_with_openai(user_text: str, times: Dict[str, str]) -> Dict[str, Any]:
-    if OpenAI is None:
-        return {"error": "Библиотека openai не установлена. Установите зависимости из requirements.txt."}
     if not OPENAI_API_KEY:
         return {"error": "OPENAI_API_KEY не задан в .env"}
 
@@ -341,17 +482,27 @@ def parse_text(user_text: str, user_times: Optional[Dict[str, Any]] = None) -> D
     try:
         times = _get_times(user_times)
 
-        # 0) Явное время (11:45) — локально и надёжно
+        # 0) Явная дата+время (21.12.25 14:48) — локально и надёжно
+        explicit_dt = _try_parse_explicit_datetime(user_text)
+        if explicit_dt is not None:
+            return explicit_dt
+
+        # 1) Явное время (11:45) — локально и надёжно
         explicit = _try_parse_explicit_time(user_text, times["default"])
         if explicit is not None:
             return explicit
 
-        # 1) Простые "утром/днем/вечером" — тоже локально (с учётом настроек)
+
+        # 2) Простые "утром/днем/вечером" — тоже локально (с учётом настроек)
         simple_parts = _try_parse_simple_dayparts(user_text, times)
         if simple_parts is not None:
             return simple_parts
+        relative_day_only = _try_parse_relative_day_only(user_text, times["default"])
+        if relative_day_only is not None:
+            return relative_day_only
 
-        # 2) Если вообще нет признаков даты/времени — ставим default_time локально
+
+        # 3) Если вообще нет признаков даты/времени — ставим default_time локально
         if not _looks_like_datetime_text(user_text):
             return {
                 "task": _clean_task(user_text),
@@ -360,7 +511,7 @@ def parse_text(user_text: str, user_times: Optional[Dict[str, Any]] = None) -> D
                 "error": None,
             }
 
-        # 3) Иначе — OpenAI
+        # 4) Иначе — OpenAI
         return _parse_with_openai(user_text, times)
 
     except Exception as e:
@@ -373,7 +524,11 @@ def parse_text(user_text: str, user_times: Optional[Dict[str, Any]] = None) -> D
 
 def _simple_split_lines(text: str) -> List[str]:
     """
-    Дёшево и сердито: сначала пробуем разрезать по строкам/маркерам без OpenAI.
+    Дёшево и сердито: сначала пробуем разрезать без OpenAI.
+
+    Важно для голосовых:
+    - поддерживаем случаи вида: "через 2 минуты ..., через 5 минут ... и через 2 часа ..."
+    - поддерживаем "22.12.25 ... . вечером ... . и послезавтра ..."
     """
     t = (text or "").strip()
     if not t:
@@ -381,10 +536,11 @@ def _simple_split_lines(text: str) -> List[str]:
 
     # нормализуем переносы
     t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\s+", " ", t).strip()
 
-    # если явно несколько строк — режем по строкам
+    # 1) если явно несколько строк — режем по строкам
     if "\n" in t:
-        parts = []
+        parts: List[str] = []
         for line in t.split("\n"):
             line = line.strip()
             line = re.sub(r"^[•\-–—\*\d\)\.]+\s*", "", line)  # убираем маркеры
@@ -392,60 +548,38 @@ def _simple_split_lines(text: str) -> List[str]:
                 parts.append(line)
         return parts if len(parts) >= 2 else [t]
 
-    # если в одной строке, но много " ; " — можно попробовать разделить
+    # 2) точка с запятой — почти всегда разделитель
     if ";" in t:
         parts = [p.strip() for p in t.split(";") if p.strip()]
         return parts if len(parts) >= 2 else [t]
 
-    # Эвристика для одной строки без переносов:
-    # часто в голосе несколько напоминаний идут одной строкой.
-    # Пример: "через 5 минут ... и через 2 часа ...".
-    lower = t.lower()
+    # 3) если есть несколько "временных якорей", пробуем расставить переносы.
+    anchor_next = r"(?:через\b|сегодня\b|завтра\b|послезавтра\b|утром\b|утра\b|дн[её]м\b|днем\b|вечером\b|вечера\b|\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b|\d{1,2}[:.]\d{2}\b)"
+    anchors = re.findall(anchor_next, t, flags=re.IGNORECASE)
 
-    # если есть минимум два временных маркера — вероятно это несколько напоминаний
-    time_markers = re.findall(
-        r"\b(через|завтра|сегодня|послезавтра|утром|дн[её]м|вечером|в\s+\d{1,2}([:.]\d{2})?)\b",
-        lower,
-    )
+    if len(anchors) >= 2:
+        # ✅ Разделяем по окончаниям предложений, если дальше начинается новый "якорь"
+        t2 = re.sub(rf"[.!?]\s*(?={anchor_next})", "\n", t, flags=re.IGNORECASE)
 
-    if len(time_markers) >= 2:
-        # 1) Сначала пробуем "умное" разбиение по повторяющимся временным маркерам.
-        # Это хорошо работает для фраз вида:
-        # "через 2 минуты ..., через 5 минут ..., и через 2 часа ..."
-        marker_re = re.compile(
-            r"\b(через|завтра|сегодня|послезавтра|утром|дн[её]м|вечером)\b|\bв\s+\d{1,2}([:.]\d{2})?\b",
-            flags=re.IGNORECASE,
-        )
-        starts = [m.start() for m in marker_re.finditer(t)]
-        if len(starts) >= 2:
-            cuts = [0] + starts[1:] + [len(t)]
-            parts = []
-            for a, b in zip(cuts, cuts[1:]):
-                chunk = t[a:b].strip(" \t\n,.;")
-                # убираем ведущие связки
-                chunk = re.sub(r"^(и|а|потом|затем|а потом)\b\s*", "", chunk, flags=re.IGNORECASE)
-                # убираем ведущие общие слова
-                chunk = re.sub(r"^(надо|нужно|пожалуйста|план)\b\s*", "", chunk, flags=re.IGNORECASE)
-                # убираем хвостовые связки, чтобы не мешали дальнейшему парсингу
-                chunk = re.sub(r"\s+(и|потом|затем)\s*$", "", chunk, flags=re.IGNORECASE)
-                chunk = chunk.strip(" \t\n,.;")
-                if chunk:
-                    parts.append(chunk)
+        # запятая перед новым напоминанием
+        t2 = re.sub(rf",\s*(?={anchor_next})", "\n", t2, flags=re.IGNORECASE)
 
-            if len(parts) >= 2:
-                return parts
+        # "и/а" перед новым напоминанием
+        t2 = re.sub(rf"\s+(?:и|а)\s+(?={anchor_next})", "\n", t2, flags=re.IGNORECASE)
 
-        # 2) Если не получилось — пробуем разделители в порядке приоритета
-        splitters = [
-            r"\s+а\s+потом\s+",
-            r"\s+затем\s+",
-            r"\s+потом\s+",
-            r"\s+и\s+",
-        ]
-        for sp in splitters:
-            parts = [p.strip(" ,.;") for p in re.split(sp, t, flags=re.IGNORECASE) if p.strip()]
-            if len(parts) >= 2:
-                return parts
+        # "потом/затем/а потом" перед новым напоминанием
+        t2 = re.sub(rf"\s+(?:а\s+потом|потом|затем)\s+(?={anchor_next})", "\n", t2, flags=re.IGNORECASE)
+
+        parts = [p.strip(" ,") for p in t2.split("\n") if p.strip(" ,")]
+
+        # лёгкая чистка префиксов
+        cleaned: List[str] = []
+        for p in parts:
+            p = re.sub(r"^(?:нужно|надо|пожалуйста)\s+", "", p, flags=re.IGNORECASE).strip()
+            if p:
+                cleaned.append(p)
+
+        return cleaned if len(cleaned) >= 2 else [t]
 
     return [t]
 
@@ -465,13 +599,9 @@ def split_into_reminders(text: str, model: str = "gpt-4o-mini") -> dict:
 
         # 2) если получилось 1 — можно всё равно вернуть 1
         if len(items) == 1:
-            # если строка короткая и без явных разделителей — не тратим токены
             return {"items": items, "error": None}
 
         # 3) fallback на OpenAI (на всякий)
-        if OpenAI is None:
-            return {"items": [], "error": "Библиотека openai не установлена. Установите зависимости из requirements.txt."}
-
         if not OPENAI_API_KEY:
             return {"items": [], "error": "OPENAI_API_KEY не задан в .env"}
 
