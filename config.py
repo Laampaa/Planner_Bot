@@ -20,13 +20,9 @@ def _require(name: str, value: str) -> None:
         )
 
 
-def validate_config(require_openai: bool = True) -> None:
-    """Проверяем обязательные переменные окружения.
-
-    Важно: не падаем при импорте модуля, чтобы можно было импортировать
-    парсер/утилиты в тестах и интерактивной отладке.
-    """
+def validate_config(require_openai: bool = True):
     _require("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
-    _require("CHANNEL_ID", CHANNEL_ID)
+
     if require_openai:
         _require("OPENAI_API_KEY", OPENAI_API_KEY)
+

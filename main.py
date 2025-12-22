@@ -16,21 +16,21 @@ from telegram.ext import (
     filters,
 )
 
-from config import CHANNEL_ID as CHANNEL_ID_ENV, TELEGRAM_BOT_TOKEN, validate_config
+from config import TELEGRAM_BOT_TOKEN, validate_config
 from parser import parse_text, split_into_reminders
 from speech import recognize_audio
 from utils import (
     add_reminder,
-    delete_reminder,
+    delete_reminder_for_user,
     ensure_user_settings,
     fetch_due_reminders,
     fetch_pending_reminders,
-    get_setting,
+    get_user_channel,
     get_user_settings,
     init_db,
     mark_error,
     mark_sent,
-    set_setting,
+    update_user_channel,
     update_user_times,
 )
 
@@ -72,9 +72,39 @@ def _is_valid_hhmm(value: str) -> bool:
     return 0 <= h <= 23 and 0 <= m <= 59
 
 
-def _get_channel_id() -> str:
-    # Если канал задан через бота — берём из БД, иначе из env
-    return get_setting("channel_id") or str(CHANNEL_ID_ENV)
+def _get_channel_id_for_user(user_id: int) -> Optional[str]:
+    """
+    Строгая многоканальность: канал берём только из user_settings.
+    Если нет — считаем, что канал не подключён.
+    """
+    ensure_user_settings(user_id)
+    ch = get_user_channel(user_id)
+    return str(ch).strip() if ch else None
+
+
+def _get_user_times_for_parser(user_id: int) -> dict:
+    """
+    Возвращает словарь для parser.parse_text(..., user_times=...)
+    Поддерживает оба варианта ключей из БД:
+    - morning/day/evening/default
+    - morning_time/day_time/evening_time/default_time
+    """
+    ensure_user_settings(user_id)
+    s = get_user_settings(user_id) or {}
+
+    morning = s.get("morning") or s.get("morning_time") or "09:00"
+    day = s.get("day") or s.get("day_time") or "14:00"
+    evening = s.get("evening") or s.get("evening_time") or "20:00"
+    default = s.get("default") or s.get("default_time") or "20:00"
+
+    return {
+        "morning": morning,
+        "day": day,
+        "evening": evening,
+        "default": default,
+    }
+
+
 def _normalize_user_times(raw: Dict[str, Any]) -> Dict[str, str]:
     """
     Приводим то, что лежит в user_settings, к ключам:
@@ -161,8 +191,8 @@ async def _send_channel_and_time_intro(update: Update, context: ContextTypes.DEF
     intro = (
         "✅ Канал подключён!\n\n"
         "⏰ Как я понимаю время в напоминаниях:\n\n"
-        "• Если время не указано — напоминание будет запланировано на сегодня в 20:00\n"
-        "  (если это время уже прошло — на завтра в 20:00)\n\n"
+        "• Если время не указано — напоминание будет запланировано на сегодня по настроенному дефолту\n"
+        "  (если это время уже прошло — на завтра)\n\n"
         "• Я понимаю формулировки:\n"
         "  «утром», «днём», «вечером», «завтра», «через 2 часа»,\n"
         "  «в субботу», «в 11:45», «в пол 8»\n\n"
@@ -210,7 +240,15 @@ async def _send_usage_after_times(update: Update, context: ContextTypes.DEFAULT_
 # Команды
 # --------------------
 async def pingchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channel_id = _get_channel_id()
+    user_id = update.effective_user.id
+    channel_id = _get_channel_id_for_user(user_id)
+    if not channel_id:
+        await update.message.reply_text(
+            "⚠️ Канал не подключён.\n\n"
+            "Перешлите мне любое сообщение из вашего канала или используйте:\n"
+            "/setchannel -1001234567890"
+        )
+        return
     ok, msg = await _check_channel_access(context.bot, channel_id)
     if ok:
         await update.message.reply_text("✅ Успешно! Я могу писать в канал.")
@@ -255,13 +293,15 @@ async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    set_setting("channel_id", channel_id)
+    user_id = update.effective_user.id
+    ensure_user_settings(user_id)
+    update_user_channel(user_id, channel_id)
+
     # Не дублируем "Канал подключён": в онбординге эта строка уже есть в интро.
     if not context.user_data.get("skip_onboarding"):
         await _send_channel_and_time_intro(update, context)
     else:
         await update.message.reply_text("✅ Канал подключён!")
-
 
 async def times_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -324,7 +364,8 @@ async def times_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = fetch_pending_reminders(limit=50)
+    user_id = update.effective_user.id
+    rows = fetch_pending_reminders(user_id=user_id, limit=50)
     if not rows:
         await update.message.reply_text("✅ Нет активных (pending) напоминаний.")
         return
@@ -352,7 +393,8 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("id должен быть числом. Пример: /delete 12")
         return
 
-    ok = delete_reminder(rid)
+    user_id = update.effective_user.id
+    ok = delete_reminder_for_user(rid, user_id)
     await update.message.reply_text("✅ Удалено." if ok else "Не нашла такое напоминание.")
 
 
@@ -467,20 +509,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        set_setting("channel_id", channel_id)
+        user_id = update.effective_user.id
+        ensure_user_settings(user_id)
+        update_user_channel(user_id, channel_id)
+
         # Не дублируем "Канал подключён": оно уже есть в интро.
         if not context.user_data.get("skip_onboarding"):
             await _send_channel_and_time_intro(update, context)
         else:
             await update.message.reply_text("✅ Канал подключён!")
+        return
 
+    # Multi-channel: без канала пользователя не создаём напоминания
+    user_id = update.effective_user.id
+    if not _get_channel_id_for_user(user_id):
+        await update.message.reply_text(
+            "⚠️ Сначала подключите ваш канал.\n\n"
+            "Перешлите мне любое сообщение из вашего канала или используйте:\n"
+            "/setchannel -1001234567890"
+        )
         return
 
     user_text = update.message.text or ""
 
     # обычный текст — напоминания (1 или пакет)
     await _process_text_or_batch(update, context, user_text)
-
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.voice:
@@ -502,6 +555,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("Не удалось распознать речь. Попробуйте ещё раз.")
             return
 
+        # Multi-channel: без канала пользователя не создаём напоминания
+        user_id = update.effective_user.id
+        if not _get_channel_id_for_user(user_id):
+            await status.edit_text(
+                "⚠️ Сначала подключите ваш канал.\n\n"
+                "Перешлите мне любое сообщение из вашего канала или используйте:\n"
+                "/setchannel -1001234567890"
+            )
+            return
+
         # Голос: сначала пробуем разделить в "умном" режиме (если не выйдет — по строкам)
         split = await asyncio.to_thread(split_into_reminders, text)
         if split.get("error"):
@@ -519,10 +582,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await status.edit_text(f"Ошибка распознавания: {e}")
 
-
-# --------------------
-# Кнопки
-# --------------------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -621,8 +680,18 @@ async def reminders_loop(app: Application, interval_seconds: int = 15):
             for r in due:
                 reminder_id = r["id"]
                 try:
+                    user_id = r.get("user_id")
+                    if not user_id:
+                        mark_error(reminder_id, "Не указан user_id у напоминания")
+                        continue
+
+                    channel_id = _get_channel_id_for_user(int(user_id))
+                    if not channel_id:
+                        mark_error(reminder_id, "У пользователя не подключён канал")
+                        continue
+
                     text = f"⏰ Напоминание: {r['task']}\n\n"
-                    await app.bot.send_message(chat_id=_get_channel_id(), text=text)
+                    await app.bot.send_message(chat_id=channel_id, text=text)
                     mark_sent(reminder_id)
                 except Exception as e:
                     mark_error(reminder_id, str(e))
@@ -643,8 +712,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # Валидируем env-переменные при запуске бота (а не при импорте модулей)
-    validate_config(require_openai=True)
     init_db()
 
     application = (

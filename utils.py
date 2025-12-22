@@ -61,6 +61,13 @@ def init_db() -> None:
             """
         )
 
+        # --- MIGRATION: add channel_id to user_settings if missing ---
+        cur.execute("PRAGMA table_info(user_settings)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "channel_id" not in cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN channel_id TEXT")
+
+
         conn.commit()
     finally:
         conn.close()
@@ -137,7 +144,7 @@ def fetch_due_reminders(limit: int = 20) -> List[dict]:
         conn.close()
 
 
-def fetch_pending_reminders(limit: int = 50) -> List[dict]:
+def fetch_pending_reminders(user_id: Optional[int] = None, limit: int = 50) -> List[dict]:
     conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
@@ -146,11 +153,11 @@ def fetch_pending_reminders(limit: int = 50) -> List[dict]:
             """
             SELECT id, task, original, scheduled_ts, created_ts
             FROM reminders
-            WHERE status = 'pending'
+            WHERE status = 'pending' AND (? IS NULL OR user_id = ?)
             ORDER BY scheduled_ts ASC
             LIMIT ?
             """,
-            (limit,),
+            (user_id, user_id, limit),
         )
         rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -243,5 +250,46 @@ def update_user_times(user_id: int, morning: str, day: str, evening: str, defaul
             (user_id, morning, day, evening, default, int(time.time())),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def update_user_channel(user_id: int, channel_id: str) -> None:
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO user_settings (user_id, channel_id, updated_ts)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                channel_id=excluded.channel_id,
+                updated_ts=excluded.updated_ts
+            """,
+            (user_id, channel_id.strip(), int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user_channel(user_id: int) -> Optional[str]:
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT channel_id FROM user_settings WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    finally:
+        conn.close()
+
+
+def delete_reminder_for_user(reminder_id: int, user_id: int) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM reminders WHERE id=? AND user_id=?", (reminder_id, user_id))
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
