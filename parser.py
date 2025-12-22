@@ -27,12 +27,9 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _clean_task(text: str) -> str:
-    t = text.strip()
+    t = (text or "").strip()
     t = re.sub(r"\s+", " ", t)
     t = t.strip(" .,!?:;—-")
-    words = t.split()
-    if len(words) > 7:
-        t = " ".join(words[:7])
     return t
 
 
@@ -248,6 +245,7 @@ def _try_parse_explicit_time(user_text: str, default_time_hhmm: str) -> Optional
     """
     Локально ловим явное время вида 11:45 или 11.45.
     ✅ Учитываем слова "сегодня/завтра/послезавтра".
+    ✅ Учитываем "вечером/ночью" => PM (21:30).
     """
     t = user_text.strip()
     m = re.search(r"\b(\d{1,2})[:.](\d{2})\b", t)
@@ -269,16 +267,20 @@ def _try_parse_explicit_time(user_text: str, default_time_hhmm: str) -> Optional
     now = _now_moscow()
     tl = t.lower()
 
+    # ✅ День (сегодня/завтра/послезавтра)
     base = now
     if "послезавтра" in tl:
         base = now + timedelta(days=2)
     elif "завтра" in tl:
         base = now + timedelta(days=1)
-    # "сегодня" -> base = now
+
+    # ✅ PM-логика для "вечером / ночью"
+    if hh < 12 and re.search(r"\b(вечером|вечера|ночью)\b", tl):
+        hh += 12
 
     dt = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-    # если всё равно получилось в прошлом (например "сегодня в 10", а уже 12) — переносим на завтра
+    # если всё равно получилось в прошлом — переносим на завтра
     if dt <= now:
         dt = dt + timedelta(days=1)
 
