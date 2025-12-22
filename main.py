@@ -2,11 +2,13 @@ import asyncio
 import logging
 import os
 import tempfile
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -16,7 +18,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import CHANNEL_ID as CHANNEL_ID_ENV, TELEGRAM_BOT_TOKEN, validate_config
+from config import TELEGRAM_BOT_TOKEN, validate_config
 from parser import parse_text, split_into_reminders
 from speech import recognize_audio
 from utils import (
@@ -25,16 +27,13 @@ from utils import (
     ensure_user_settings,
     fetch_due_reminders,
     fetch_pending_reminders,
-    get_setting,
     get_user_settings,
     init_db,
     mark_error,
     mark_sent,
-    set_setting,
     update_user_times,
     get_user_channel,
     update_user_channel,
-
 )
 
 # --------------------
@@ -75,9 +74,12 @@ def _is_valid_hhmm(value: str) -> bool:
     return 0 <= h <= 23 and 0 <= m <= 59
 
 
-def _get_channel_id() -> str:
-    # Если канал задан через бота — берём из БД, иначе из env
-    return get_setting("channel_id") or str(CHANNEL_ID_ENV)
+def _get_channel_id_for_user(user_id: int) -> Optional[str]:
+    """Строгая многоканальность: канал хранится только в user_settings.channel_id."""
+    ensure_user_settings(user_id)
+    ch = get_user_channel(user_id)
+    return str(ch).strip() if ch else None
+
 def _normalize_user_times(raw: Dict[str, Any]) -> Dict[str, str]:
     """
     Приводим то, что лежит в user_settings, к ключам:
@@ -132,35 +134,46 @@ def _split_lines(text: str) -> List[str]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # новый цикл онбординга при каждом /start
     context.user_data.pop("awaiting_times_confirm", None)
-    await context.bot.send_photo(
-        chat_id=update.effective_chat.id,
-        photo=InputFile("assets/onboarding.png"),
-        caption=(
-            "👋 Привет!\n"
-            "Я PlannerBot — принимаю напоминания и публикую их в вашем Telegram-канале в нужное время.\n\n"
 
-            "📝 Как это работает:\n"
-            "• У вас есть канал, куда будут приходить напоминания\n"
-            "• Вы пишите в бот текст напоминания и указываете время, когда нужно его прислать (текстом или голосом)\n"
-            "• В нужный момент бот отправит напоминание в ваш канал\n\n"
-
-            "📌 Пример:\n"
-            "«Купить продукты послезавтра утром»\n"
-            "«1 января покататься на лыжах»\n\n"
-
-            "1️⃣ Для старта настроим бот:\n\n"
-            "0) Создайте приватный Telegram-канал (туда будут приходить напоминания)\n"
-            "1) Добавьте бота в ваш канал\n"
-            "2) Назначьте бота администратором канала\n"
-            "3) Дайте право «Публиковать сообщения»\n"
-            "4) Привяжите канал к боту:\n"
-            "   • перешлите в бот любое сообщение из нужного канала\n\n"
-
-            "После подключения канала продолжим настройку 👇"
-        )
+    caption = (
+        "👋 Привет!\n"
+        "Я PlannerBot — принимаю напоминания и публикую их в вашем Telegram-канале в нужное время.\n\n"
+        "📝 Как это работает:\n"
+        "• У вас есть канал, куда будут приходить напоминания\n"
+        "• Вы пишите в бот текст напоминания и указываете время, когда нужно его прислать (текстом или голосом)\n"
+        "• В нужный момент бот отправит напоминание в ваш канал\n\n"
+        "📌 Пример:\n"
+        "«Купить продукты послезавтра утром»\n"
+        "«1 января покататься на лыжах»\n\n"
+        "1️⃣ Для старта настроим бот:\n\n"
+        "0) Создайте приватный Telegram-канал (туда будут приходить напоминания)\n"
+        "1) Добавьте бота в ваш канал\n"
+        "2) Назначьте бота администратором канала\n"
+        "3) Дайте право «Публиковать сообщения»\n"
+        "4) Привяжите канал к боту:\n"
+        "   • перешлите в бот любое сообщение из нужного канала\n\n"
+        "После подключения канала продолжим настройку 👇"
     )
 
+    img_path = Path("assets/onboarding.png")
+    if not img_path.exists():
+        # не ломаем /start, если картинки нет в контейнере
+        await update.effective_message.reply_text(caption)
+        return
 
+    try:
+        with img_path.open("rb") as f:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=f,
+                caption=caption,
+            )
+    except BadRequest as e:
+        # Telegram иногда не может обработать файл (битый/неподдерживаемый формат)
+        if "Image_process_failed" in str(e):
+            await update.effective_message.reply_text(caption)
+        else:
+            raise
 
 async def _send_channel_and_time_intro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -172,14 +185,14 @@ async def _send_channel_and_time_intro(update: Update, context: ContextTypes.DEF
     s = _normalize_user_times(get_user_settings(user_id))
 
     intro = (
-        "✅ Канал подключён! Туда будут приходить напоминания. \n\n"
-        "⏰ Как бот понимает время в напоминаниях:\n\n"
-        "• Если время не указано — напоминание будет запланировано на время по умолчанию\n"
-        "  (если это время уже прошло — на завтра)\n\n"
+        "✅ Канал подключён!\n\n"
+        "⏰ Как я понимаю время в напоминаниях:\n\n"
+        "• Если время не указано — напоминание будет запланировано на сегодня в 20:00\n"
+        "  (если это время уже прошло — на завтра в 20:00)\n\n"
         "• Я понимаю формулировки:\n"
         "  «утром», «днём», «вечером», «завтра», «через 2 часа»,\n"
         "  «в субботу», «в 11:45», «в пол 8»\n\n"
-        "👉 Можете настроить, когда для вас «утро / день / вечер».\n\n"
+        "👉 Рекомендую настроить, когда для вас «утро / день / вечер».\n\n"
         "Сейчас так:\n"
         f"🌅 Утро:{s['morning']}\n"
         f"🌞 День:{s['day']}\n"
@@ -207,17 +220,15 @@ async def _send_usage_after_times(update: Update, context: ContextTypes.DEFAULT_
     await msg.reply_text(
         "✅ Время настроено!\n\n"
         "📝 Как пользоваться ботом:\n\n"
-        "• Отправьте текст или голосовое сообщение с напоминанием\n"
-        "• Подтвердите результат\n"
-        "• После подтверждения напоминание будет отправлено в ваш канал в нужное время\n\n"
-        
-         "📌 Пример напоминаний:\n"
-            "«Не забыть покормить кота»\n"
-            "«31 декабря встретить Новый год»\n\n"
-            
+        "• Отправь текст или голосовое сообщение с напоминанием \n"
+        "• Я разберу задачу и время\n"
+        "• Покажу результат и попрошу подтверждение\n"
+        "• После подтверждения напоминание будет отправлено в канал в нужное время\n\n"
         "📎 Доступные команды:\n"
         "/times — настройки времени (утро / день / вечер)\n"
         "/list — список активных напоминаний и удаление\n"
+        "/setchannel — указать канал (пересылкой сообщения из канала или вручную)\n"
+        "/pingchannel — проверить доступ к каналу"
     )
 
 
@@ -225,7 +236,16 @@ async def _send_usage_after_times(update: Update, context: ContextTypes.DEFAULT_
 # Команды
 # --------------------
 async def pingchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channel_id = _get_channel_id()
+    user_id = update.effective_user.id
+    channel_id = _get_channel_id_for_user(user_id)
+    if not channel_id:
+        await update.message.reply_text(
+            "⚠️ Канал не подключён.\n\n"
+            "Перешлите мне любое сообщение из канала или используйте:\n"
+            "/setchannel -1001234567890"
+        )
+        return
+
     ok, msg = await _check_channel_access(context.bot, channel_id)
     if ok:
         await update.message.reply_text("✅ Успешно! Я могу писать в канал.")
@@ -238,7 +258,6 @@ async def pingchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• бот администратор\n"
             "• есть право «Публиковать сообщения»"
         )
-
 
 async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # /setchannel -1001234567890
@@ -270,8 +289,9 @@ async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    set_setting("channel_id", channel_id)
-    # Всегда продолжаем онбординг после успешного подключения канала.
+    user_id = update.effective_user.id
+    ensure_user_settings(user_id)
+    update_user_channel(user_id, channel_id)
     await _send_channel_and_time_intro(update, context)
 
 
@@ -479,8 +499,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        set_setting("channel_id", channel_id)
-        # Всегда продолжаем онбординг после успешного подключения канала.
+        user_id = update.effective_user.id
+        ensure_user_settings(user_id)
+        update_user_channel(user_id, channel_id)
         await _send_channel_and_time_intro(update, context)
 
         return
@@ -626,7 +647,10 @@ async def reminders_loop(app: Application, interval_seconds: int = 15):
                 reminder_id = r["id"]
                 try:
                     text = f"⏰ Напоминание: {r['task']}\n\n"
-                    await app.bot.send_message(chat_id=_get_channel_id(), text=text)
+                    channel_id = _get_channel_id_for_user(int(r["user_id"]))
+                    if not channel_id:
+                        raise RuntimeError("Канал не подключён для этого пользователя")
+                    await app.bot.send_message(chat_id=channel_id, text=text)
                     mark_sent(reminder_id)
                 except Exception as e:
                     mark_error(reminder_id, str(e))
