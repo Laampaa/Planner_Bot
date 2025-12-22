@@ -6,7 +6,8 @@ services:
     env_file:
       - .env
     volumes:
-      - plannerbot_db:/app/data
+      - plannerbot_db:/data
 
 volumes:
   plannerbot_db:
+    name: plannerbot_db
