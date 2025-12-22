@@ -1,11 +1,13 @@
-import os
 import sqlite3
+import os
 import time
 from pathlib import Path
 from typing import Optional, List
 
-# БД должна жить в постоянном хранилище (volume)
-DB_PATH = Path(os.getenv("DB_PATH", "/data/reminders.db")).resolve()
+
+# База всегда рядом с этим файлом utils.py
+
+DB_PATH = Path(os.getenv('DB_PATH', '/data/reminders.db')).resolve()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
