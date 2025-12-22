@@ -294,6 +294,148 @@ def _try_parse_explicit_time(user_text: str, default_time_hhmm: str) -> Optional
         "error": None,
     }
 
+def _try_parse_space_time(user_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Ловим время вида: 'в 9 30', '9 30 вечером', 'в 21 05'.
+    """
+    t = (user_text or "").strip()
+    tl = t.lower()
+
+    m = re.search(r"\bв?\s*(\d{1,2})\s+(\d{2})\b", tl)
+    if not m:
+        return None
+
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+
+    now = _now_moscow()
+
+    # дата: сегодня / завтра / послезавтра
+    base = now
+    if "послезавтра" in tl:
+        base = now + timedelta(days=2)
+    elif "завтра" in tl:
+        base = now + timedelta(days=1)
+
+    # вечер / ночь => PM
+    if hh < 12 and re.search(r"\b(вечером|вечера|ночью)\b", tl):
+        hh += 12
+
+    dt = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if dt <= now:
+        dt = dt + timedelta(days=1)
+
+    # вырезаем 'в 9 30'
+    task_text = (t[:m.start()] + " " + t[m.end():]).strip()
+    task_text = _clean_task(task_text)
+
+    return {
+        "task": task_text if task_text else _clean_task(t),
+        "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "original": user_text,
+        "error": None,
+    }
+
+
+_HOUR_WORDS = {
+    "один": 1, "одна": 1,
+    "два": 2, "две": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "одиннадцать": 11,
+    "двенадцать": 12,
+}
+
+_MINUTE_WORDS = {
+    "ноль": 0,
+    "пять": 5,
+    "десять": 10,
+    "пятнадцать": 15,
+    "двадцать": 20,
+    "двадцать пять": 25,
+    "тридцать": 30,
+    "сорок": 40,
+    "сорок пять": 45,
+    "пятьдесят": 50,
+    "пятьдесят пять": 55,
+}
+
+_SPOKEN_TIME_RE = re.compile(
+    r"""(?ix)
+    \bв\s+
+    (?P<hour>одиннадцать|двенадцать|десять|девять|восемь|семь|шесть|пять|четыре|три|два|две|один|одна)
+    (?:\s+
+      (?P<minute>
+        ноль\s+пять|ноль\s+десять|ноль\s+пятнадцать|
+        двадцать\s+пять|сорок\s+пять|пятьдесят\s+пять|
+        пятнадцать|двадцать|тридцать|сорок|пятьдесят|
+        пять|десять
+      )
+    )?
+    \b
+    """
+)
+
+def _try_parse_spoken_time(user_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Локально ловим время словами: "в девять тридцать", "в десять", "в девять тридцать вечером".
+    """
+    t = (user_text or "").strip()
+    tl = t.lower()
+
+    m = _SPOKEN_TIME_RE.search(tl)
+    if not m:
+        return None
+
+    hour_word = m.group("hour")
+    minute_word = (m.group("minute") or "").strip()
+
+    hh = _HOUR_WORDS.get(hour_word)
+    if hh is None:
+        return None
+
+    mm = 0
+    if minute_word:
+        minute_word = re.sub(r"\s+", " ", minute_word)
+        mm = _MINUTE_WORDS.get(minute_word, None)
+        if mm is None:
+            return None
+
+    now = _now_moscow()
+
+    # дата: сегодня/завтра/послезавтра
+    base = now
+    if "послезавтра" in tl:
+        base = now + timedelta(days=2)
+    elif "завтра" in tl:
+        base = now + timedelta(days=1)
+
+    # вечер/ночь => PM: если час < 12, добавляем 12
+    if hh < 12 and re.search(r"\b(вечером|вечера|ночью)\b", tl):
+        hh += 12
+
+    dt = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if dt <= now:
+        dt = dt + timedelta(days=1)
+
+    # убираем кусок "в девять тридцать" из задачи
+    task_text = (t[:m.start()] + " " + t[m.end():]).strip()
+    task_text = _clean_task(task_text)
+
+    return {
+        "task": task_text if task_text else _clean_task(t),
+        "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "original": user_text,
+        "error": None,
+    }
 
 def _try_parse_simple_dayparts(user_text: str, times: Dict[str, str]) -> Optional[Dict[str, Any]]:
     """
@@ -493,18 +635,27 @@ def parse_text(user_text: str, user_times: Optional[Dict[str, Any]] = None) -> D
         explicit = _try_parse_explicit_time(user_text, times["default"])
         if explicit is not None:
             return explicit
+        
+        # 2) numeric time with space (9 30)
+        space_time = _try_parse_space_time(user_text)
+        if space_time is not None:
+            return space_time
+        
+        # 3) девять тридцать
+        spoken = _try_parse_spoken_time(user_text)
+        if spoken is not None:
+            return spoken
 
-
-        # 2) Простые "утром/днем/вечером" — тоже локально (с учётом настроек)
-        simple_parts = _try_parse_simple_dayparts(user_text, times)
-        if simple_parts is not None:
-            return simple_parts
+        # 4) Простые "утром/днем/вечером" — тоже локально (с учётом настроек)
         relative_day_only = _try_parse_relative_day_only(user_text, times["default"])
         if relative_day_only is not None:
             return relative_day_only
+       
+        simple_parts = _try_parse_simple_dayparts(user_text, times)
+        if simple_parts is not None:
+            return simple_parts
 
-
-        # 3) Если вообще нет признаков даты/времени — ставим default_time локально
+        # 5) Если вообще нет признаков даты/времени — ставим default_time локально
         if not _looks_like_datetime_text(user_text):
             return {
                 "task": _clean_task(user_text),
@@ -513,7 +664,7 @@ def parse_text(user_text: str, user_times: Optional[Dict[str, Any]] = None) -> D
                 "error": None,
             }
 
-        # 4) Иначе — OpenAI
+        # 6) Иначе — OpenAI
         return _parse_with_openai(user_text, times)
 
     except Exception as e:
