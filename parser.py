@@ -493,6 +493,136 @@ def _try_parse_simple_dayparts(user_text: str, times: Dict[str, str]) -> Optiona
         "error": None,
     }
 
+# 0=Monday ... 6=Sunday
+_WEEKDAY_MAP = {
+    "пн": 0, "понедельник": 0, "понедельника": 0, "понедельнику": 0,
+    "вт": 1, "вторник": 1, "вторника": 1, "вторнику": 1,
+    "ср": 2, "среда": 2, "среду": 2, "среде": 2,
+    "чт": 3, "четверг": 3, "четверга": 3, "четвергу": 3,
+    "пт": 4, "пятница": 4, "пятницу": 4, "пятнице": 4,
+    "сб": 5, "суббота": 5, "субботу": 5, "субботе": 5,
+    "вс": 6, "воскресенье": 6, "воскресенья": 6, "воскресенью": 6,
+}
+
+_WEEKDAY_RE = re.compile(
+    r"\b(?:в|во)\s+"
+    r"(пн|вт|ср|чт|пт|сб|вс|"
+    r"понедельник(?:а|у)?|вторник(?:а|у)?|"
+    r"сред[ауе]|четверг(?:а|у)?|"
+    r"пятниц[ауе]|суббот[ауе]|воскресень(?:е|я|ю))\b",
+    re.IGNORECASE,
+)
+
+_TIME_COLON_RE = re.compile(r"\b(\d{1,2})[:.](\d{2})\b")
+_TIME_SPACE_RE = re.compile(r"\b(\d{1,2})\s+(\d{2})\b")
+
+def _pick_time_from_text(t: str, times: dict) -> tuple[int, int, Optional[tuple[int,int]]]:
+    """
+    Возвращает (hh, mm, span) где span — участок текста с временем, который можно вырезать из task.
+    Если явного времени нет — берём из daypart/defaut_time.
+    """
+    tl = t.lower()
+
+    # 1) Явное время 21:30 / 9:30 / 9.30
+    m = _TIME_COLON_RE.search(tl)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        span = m.span()
+        # вечер/ночь -> PM
+        if hh < 12 and re.search(r"\b(вечером|вечера|ночью)\b", tl):
+            hh += 12
+        return hh, mm, span
+
+    # 2) Явное время "9 30" / "21 05"
+    m = _TIME_SPACE_RE.search(tl)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        span = m.span()
+        if hh < 12 and re.search(r"\b(вечером|вечера|ночью)\b", tl):
+            hh += 12
+        return hh, mm, span
+
+    # 3) Нет явного времени — берём по части дня/дефолту
+    # (у тебя уже есть _DAYPART_WORDS_RE — если нет, оставь как проверку по словам)
+    if re.search(r"\b(утром|утра)\b", tl):
+        hh, mm = map(int, times["morning"].split(":"))
+        return hh, mm, None
+    if re.search(r"\b(дн[её]м|днем)\b", tl):
+        hh, mm = map(int, times["day"].split(":"))
+        return hh, mm, None
+    if re.search(r"\b(вечером|вечера|ночью)\b", tl):
+        hh, mm = map(int, times["evening"].split(":"))
+        return hh, mm, None
+
+    hh, mm = map(int, times["default"].split(":"))
+    return hh, mm, None
+
+
+def _try_parse_weekday(user_text: str, times: dict) -> Optional[Dict[str, Any]]:
+    """
+    Ловим: "в четверг сходить на стрижку", "в чт вечером", "в четверг в 9:30", "в четверг 9 30".
+    Ставим ближайший такой день недели (от now по Москве).
+    """
+    t = (user_text or "").strip()
+    tl = t.lower()
+
+    wm = _WEEKDAY_RE.search(tl)
+    if not wm:
+        return None
+
+    token = wm.group(1).lower()
+    # нормализуем некоторые формы
+    token = token.replace("ё", "е")
+    weekday = _WEEKDAY_MAP.get(token)
+    if weekday is None:
+        return None
+
+    now = _now_moscow()
+
+    # время
+    hh, mm, time_span = _pick_time_from_text(t, times)
+
+    # ближайший weekday
+    days_ahead = (weekday - now.weekday()) % 7
+    target_date = (now + timedelta(days=days_ahead)).date()
+
+    dt = datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=hh,
+        minute=mm,
+        second=0,
+    )
+
+    # если получилось в прошлом (например сегодня тот же день недели, но время уже прошло) -> +7 дней
+    if dt <= now:
+        dt = dt + timedelta(days=7)
+
+    # чистим task: вырезаем "в четверг" + вырезаем найденное время + убираем слова части дня
+    task_text = t
+    # вырезаем weekday-кусок
+    task_text = (task_text[:wm.start()] + " " + task_text[wm.end():]).strip()
+
+    # вырезаем время, если нашли
+    if time_span is not None:
+        s, e = time_span
+        task_text = (task_text[:s] + " " + task_text[e:]).strip()
+
+    # убираем "вечером/утром/ночью" чтобы не залипало в тексте задачи
+    if "_DAYPART_WORDS_RE" in globals():
+        task_text = _DAYPART_WORDS_RE.sub("", task_text)
+
+    task_text = _clean_task(task_text)
+
+    return {
+        "task": task_text if task_text else _clean_task(t),
+        "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "original": user_text,
+        "error": None,
+    }
+
+
 def _try_parse_relative_day_only(user_text: str, default_time_hhmm: str) -> Optional[Dict[str, Any]]:
     """
     Локально обрабатываем "сегодня/завтра/послезавтра" без явного времени и без "утром/днем/вечером".
@@ -549,7 +679,7 @@ def _build_prompt(user_text: str, times: Dict[str, str]) -> str:
 
 Отвечай ТОЛЬКО в формате JSON без каких-либо пояснений:
 {{
-  "task": "краткая суть задачи (3-7 слов, без дат/времени)",
+  "task": "текст напоминания целиком (не сокращай), без даты/времени. Сохраняй важные детали и формулировки пользователя.",
   "datetime": "ГГГГ-ММ-ДД ЧЧ:ММ:СС",
   "original": "оригинальный текст"
 }}
@@ -637,6 +767,11 @@ def parse_text(user_text: str, user_times: Optional[Dict[str, Any]] = None) -> D
         explicit_dt = _try_parse_explicit_datetime(user_text)
         if explicit_dt is not None:
             return explicit_dt
+        
+        # ✅ 0.5) День недели (в четверг / в чт ...)
+        weekday_dt = _try_parse_weekday(user_text, times)
+        if weekday_dt is not None:
+            return weekday_dt
 
         # 1) Явное время (11:45) — локально и надёжно
         explicit = _try_parse_explicit_time(user_text, times["default"])
