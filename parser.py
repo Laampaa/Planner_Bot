@@ -571,28 +571,22 @@ def _try_parse_weekday(user_text: str, times: dict) -> Optional[Dict[str, Any]]:
         return None
 
     token = wm.group(1).lower()
-    # нормализуем некоторые формы
     token = token.replace("ё", "е")
     weekday = _WEEKDAY_MAP.get(token)
     if weekday is None:
         return None
 
-    now = _now_moscow()
+    now = _now_moscow()  # обычно tz-aware (Europe/Moscow)
 
     # время
     hh, mm, time_span = _pick_time_from_text(t, times)
 
     # ближайший weekday
     days_ahead = (weekday - now.weekday()) % 7
-    target_date = (now + timedelta(days=days_ahead)).date()
 
-    dt = datetime(
-        year=target_date.year,
-        month=target_date.month,
-        day=target_date.day,
-        hour=hh,
-        minute=mm,
-        second=0,
+    # ✅ ВАЖНО: создаём dt через now.replace, чтобы dt был tz-aware как now
+    dt = (now + timedelta(days=days_ahead)).replace(
+        hour=hh, minute=mm, second=0, microsecond=0
     )
 
     # если получилось в прошлом (например сегодня тот же день недели, но время уже прошло) -> +7 дней
@@ -601,15 +595,12 @@ def _try_parse_weekday(user_text: str, times: dict) -> Optional[Dict[str, Any]]:
 
     # чистим task: вырезаем "в четверг" + вырезаем найденное время + убираем слова части дня
     task_text = t
-    # вырезаем weekday-кусок
     task_text = (task_text[:wm.start()] + " " + task_text[wm.end():]).strip()
 
-    # вырезаем время, если нашли
     if time_span is not None:
         s, e = time_span
         task_text = (task_text[:s] + " " + task_text[e:]).strip()
 
-    # убираем "вечером/утром/ночью" чтобы не залипало в тексте задачи
     if "_DAYPART_WORDS_RE" in globals():
         task_text = _DAYPART_WORDS_RE.sub("", task_text)
 
