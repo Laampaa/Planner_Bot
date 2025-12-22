@@ -182,6 +182,8 @@ _DATE_TOKEN_RE = re.compile(
     """
 )
 
+_DAYPART_WORDS_RE = re.compile(r"\b(утром|утра|дн[её]м|днем|вечером|вечера|ночью)\b", re.IGNORECASE)
+
 
 def _normalize_year_2or4(y: Optional[str]) -> int:
     """
@@ -285,7 +287,9 @@ def _try_parse_explicit_time(user_text: str, default_time_hhmm: str) -> Optional
         dt = dt + timedelta(days=1)
 
     task_text = re.sub(r"\bв\s*\d{1,2}[:.]\d{2}\b", "", t, flags=re.IGNORECASE)
+    task_text = _DAYPART_WORDS_RE.sub("", task_text)  # ✅ убираем "вечера/вечером/утром..."
     task_text = _clean_task(task_text)
+
 
     return {
         "task": task_text if task_text else _clean_task(t),
@@ -327,9 +331,11 @@ def _try_parse_space_time(user_text: str) -> Optional[Dict[str, Any]]:
     if dt <= now:
         dt = dt + timedelta(days=1)
 
-    # вырезаем 'в 9 30'
+    # вырезаем 'в 9 30 вечера'
     task_text = (t[:m.start()] + " " + t[m.end():]).strip()
+    task_text = _DAYPART_WORDS_RE.sub("", task_text)
     task_text = _clean_task(task_text)
+
 
     return {
         "task": task_text if task_text else _clean_task(t),
@@ -428,6 +434,7 @@ def _try_parse_spoken_time(user_text: str) -> Optional[Dict[str, Any]]:
 
     # убираем кусок "в девять тридцать" из задачи
     task_text = (t[:m.start()] + " " + t[m.end():]).strip()
+    task_text = _DAYPART_WORDS_RE.sub("", task_text)
     task_text = _clean_task(task_text)
 
     return {
