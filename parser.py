@@ -705,11 +705,13 @@ def _try_parse_weekday(user_text: str, times: dict) -> Optional[Dict[str, Any]]:
     }
 
 
-
 def _try_parse_relative_day_only(user_text: str, default_time_hhmm: str) -> Optional[Dict[str, Any]]:
     """
-    Локально обрабатываем "сегодня/завтра/послезавтра" без явного времени и без "утром/днем/вечером".
-    Ставим default_time.
+    Локально обрабатываем "сегодня/завтра/послезавтра" без "утром/днем/вечером" и без явной даты.
+    Поддерживаем:
+      - просто "завтра/послезавтра" -> default_time
+      - "завтра в 10" / "послезавтра в 17" -> HH:00
+    Все остальные форматы времени ("10:30", "9 30") пусть разбирают другие правила.
     """
     t = (user_text or "").strip()
     tl = t.lower()
@@ -717,30 +719,55 @@ def _try_parse_relative_day_only(user_text: str, default_time_hhmm: str) -> Opti
     if "послезавтра" not in tl and "завтра" not in tl and "сегодня" not in tl:
         return None
 
-    # если в тексте есть явное время или цифры/дата — пусть это решают другие правила
-    if re.search(r"\b\d{1,2}[:.]\d{2}\b", tl):
-        return None
+    # если в тексте есть явная дата — пусть это решают другие правила
     if re.search(r"\b\d{1,2}[./-]\d{1,2}\b", tl):
         return None
-    if re.search(r"\b(утром|утра|дн[её]м|днем|вечером|вечера)\b", tl):
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", tl):
+        return None
+    if re.search(r"\b(утром|утра|дн[её]м|днем|вечером|вечера|ночью)\b", tl):
+        return None
+
+    # Явное время формата 10:30 / 9.30 — пусть разбирают другие правила
+    if re.search(r"\b\d{1,2}[:.]\d{2}\b", tl):
+        return None
+    # Явное время формата "9 30" — тоже в другие правила
+    if re.search(r"\b\d{1,2}\s+\d{2}\b", tl):
         return None
 
     now = _now_moscow()
-    base = now
+
+    # определяем базовый день
     if "послезавтра" in tl:
         base = now + timedelta(days=2)
     elif "завтра" in tl:
         base = now + timedelta(days=1)
-    # "сегодня" -> base = now
+    else:
+        base = now  # сегодня
 
-    hh, mm = int(default_time_hhmm[:2]), int(default_time_hhmm[3:])
+    # 1) Пытаемся поймать "в 10" / "в 17" (только час)
+    m_hour = re.search(r"\bв\s*(\d{1,2})\b", tl)
+    if m_hour:
+        hh = int(m_hour.group(1))
+        if 0 <= hh <= 23:
+            mm = 0
+        else:
+            # если час странный — откатываемся на default_time
+            hh, mm = int(default_time_hhmm[:2]), int(default_time_hhmm[3:])
+    else:
+        # 2) Иначе default_time
+        hh, mm = int(default_time_hhmm[:2]), int(default_time_hhmm[3:])
+
     dt = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-    # если вдруг "сегодня", а default уже прошел — переносим на завтра
+    # если вдруг "сегодня", а время уже прошло — переносим на завтра (как было)
     if dt <= now:
         dt = dt + timedelta(days=1)
 
-    task_text = re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", t, flags=re.IGNORECASE)
+    # чистим текст задачи:
+    # - убираем "сегодня/завтра/послезавтра"
+    # - если было "в 10" — убираем и его
+    task_text = re.sub(r"\b(сегодня|завтра|послезавтра)\b", " ", t, flags=re.IGNORECASE)
+    task_text = re.sub(r"\bв\s*\d{1,2}\b", " ", task_text, flags=re.IGNORECASE)
     task_text = _clean_task(task_text)
 
     return {
@@ -749,7 +776,6 @@ def _try_parse_relative_day_only(user_text: str, default_time_hhmm: str) -> Opti
         "original": user_text,
         "error": None,
     }
-
 
 def _build_prompt(user_text: str, times: Dict[str, str]) -> str:
     """
