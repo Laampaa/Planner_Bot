@@ -444,6 +444,85 @@ def _try_parse_spoken_time(user_text: str) -> Optional[Dict[str, Any]]:
         "error": None,
     }
 
+_MONTHS_RU = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+
+_MONTHNAME_DATE_RE = re.compile(
+    r"\b(?P<day>[0-3]?\d)\s+"
+    r"(?P<month>января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+    r"(?:\s+(?P<year>\d{2,4})\s*(?:г\.|года)?)?\b",
+    re.IGNORECASE,
+)
+
+def _try_parse_monthname_date(user_text: str, times: dict) -> Optional[Dict[str, Any]]:
+    """
+    Ловим: "28 декабря в 12:00", "28 декабря 12:00", "28 декабря в 12", "28 декабря".
+    Время берём из текста (если есть), иначе default_time / daypart.
+    Год берём из текста, иначе текущий (если дата уже прошла — следующий).
+    """
+    t = (user_text or "").strip()
+    tl = t.lower()
+
+    m = _MONTHNAME_DATE_RE.search(tl)
+    if not m:
+        return None
+
+    day = int(m.group("day"))
+    month_word = (m.group("month") or "").lower()
+    month = _MONTHS_RU.get(month_word)
+    if not month or not (1 <= day <= 31):
+        return None
+
+    now = _now_moscow()
+
+    year_raw = m.group("year")
+    if year_raw:
+        y = int(year_raw)
+        year = 2000 + y if y < 100 else y
+    else:
+        year = now.year
+
+    # время: используем общий выборщик времени (понимает 12:00, 12 00, "в 12", день/вечер и т.п.)
+    hh, mm, _ = _pick_time_from_text(t, times)
+
+    try:
+        dt = now.replace(year=year, month=month, day=day, hour=hh, minute=mm, second=0, microsecond=0)
+    except ValueError:
+        return None
+
+    # если год не задан и дата уже прошла — переносим на следующий год
+    if not year_raw and dt <= now:
+        try:
+            dt = dt.replace(year=dt.year + 1)
+        except ValueError:
+            return None
+
+    # чистим task: убираем "28 декабря [год]" + время
+    task_text = t
+    task_text = (task_text[:m.start()] + " " + task_text[m.end():]).strip()
+
+    # удаляем время (с/без "в")
+    task_text = re.sub(r"\bв\s*\d{1,2}\s*[:.]\s*\d{2}\b", " ", task_text, flags=re.IGNORECASE)
+    task_text = re.sub(r"\bв\s*\d{1,2}\s+\d{2}\b", " ", task_text, flags=re.IGNORECASE)
+    task_text = re.sub(r"\bв\s*\d{1,2}\b", " ", task_text, flags=re.IGNORECASE)
+    task_text = re.sub(r"\b\d{1,2}\s*[:.]\s*\d{2}\b", " ", task_text)
+    task_text = re.sub(r"\b\d{1,2}\s+\d{2}\b", " ", task_text)
+
+    if "_DAYPART_WORDS_RE" in globals():
+        task_text = _DAYPART_WORDS_RE.sub("", task_text)
+
+    task_text = _clean_task(task_text)
+
+    return {
+        "task": task_text if task_text else _clean_task(t),
+        "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "original": user_text,
+        "error": None,
+    }
+
+
 def _try_parse_simple_dayparts(user_text: str, times: Dict[str, str]) -> Optional[Dict[str, Any]]:
     """
     Локально обрабатываем простые случаи:
@@ -776,6 +855,11 @@ def parse_text(user_text: str, user_times: Optional[Dict[str, Any]] = None) -> D
         weekday_dt = _try_parse_weekday(user_text, times)
         if weekday_dt is not None:
             return weekday_dt
+        
+        # ✅ 0.7) "28 декабря ..." (месяц словом)
+        monthname_dt = _try_parse_monthname_date(user_text, times)
+        if monthname_dt is not None:
+            return monthname_dt
 
         # 1) Явное время (11:45) — локально и надёжно
         explicit = _try_parse_explicit_time(user_text, times["default"])
